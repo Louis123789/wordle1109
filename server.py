@@ -8,7 +8,6 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Wordle API Server")
 
-# 允許 CORS 跨來源請求
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,7 +40,8 @@ WORD_BANK = [
     "MEDAL", "MONEY", "MONTH", "MUSIC", "NIGHT", "NOVEL", "NURSE", "OCEAN", "OFFER", "ORDER"
 ]
 
-# 記憶體儲存遊戲狀態：{game_id: {"target": "APPLE", "status": "PLAYING", "attempts": 0}}
+total_games = 0
+wins = 0
 games_db: Dict[str, dict] = {}
 
 class GuessRequest(BaseModel):
@@ -49,20 +49,38 @@ class GuessRequest(BaseModel):
     guess: str
 
 @app.post("/api/new-game")
-def start_new_game():
-    """建立新一局遊戲，回傳 game_id"""
+def start_new_game(hard_mode: bool = False):
+    global total_games
+    total_games += 1
+
     game_id = str(uuid.uuid4())
     target_word = random.choice(WORD_BANK)
     games_db[game_id] = {
         "target": target_word,
         "status": "PLAYING",
-        "attempts": 0
+        "attempts": 0,
+        "hard_mode": hard_mode,
+        "green_hints": {}
     }
-    return {"game_id": game_id, "message": "New game started!"}
+    return {
+        "game_id": game_id,
+        "hard_mode": hard_mode,
+        "message": "New game started!",
+        "stats": {"total_games": total_games, "wins": wins}
+    }
+
+@app.get("/api/stats")
+def get_stats():
+    win_rate = (wins / total_games * 100) if total_games > 0 else 0.0
+    return {
+        "total_games": total_games,
+        "wins": wins,
+        "win_rate": round(win_rate, 1)
+    }
 
 @app.post("/api/guess")
 def process_guess(req: GuessRequest):
-    """接收玩家猜測，比對答案並回傳顏色結果"""
+    global wins
     game_id = req.game_id
     guess = req.guess.upper()
 
@@ -76,21 +94,33 @@ def process_guess(req: GuessRequest):
     if len(guess) != 5:
         raise HTTPException(status_code=400, detail="Word must be 5 letters.")
 
+    if guess not in WORD_BANK:
+        raise HTTPException(status_code=400, detail="Word not in dictionary")
+
     target = game_data["target"]
-    feedback = ["absent"] * 5  # 預設灰色 absent
+    hard_mode = game_data["hard_mode"]
+    green_hints = game_data["green_hints"]
+
+    if hard_mode:
+        for pos, char in green_hints.items():
+            if guess[pos] != char:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Hard Mode: Must use revealed hint at green position"
+                )
+
+    feedback = ["absent"] * 5
     target_letter_counts = {}
 
-    # 1. 先計算目標單字的各字母數量
     for char in target:
         target_letter_counts[char] = target_letter_counts.get(char, 0) + 1
 
-    # 2. 標記綠色 correct
     for i in range(5):
         if guess[i] == target[i]:
             feedback[i] = "correct"
             target_letter_counts[guess[i]] -= 1
+            green_hints[i] = guess[i]
 
-    # 3. 標記黃色 present
     for i in range(5):
         if feedback[i] != "correct" and guess[i] in target:
             if target_letter_counts[guess[i]] > 0:
@@ -100,17 +130,30 @@ def process_guess(req: GuessRequest):
     game_data["attempts"] += 1
     is_correct = (guess == target)
     
+    game_over = False
+    target_word_to_return = None
+
     if is_correct:
         game_data["status"] = "WON"
+        game_over = True
+        wins += 1
+        target_word_to_return = target
     elif game_data["attempts"] >= 6:
         game_data["status"] = "LOST"
+        game_over = True
+        target_word_to_return = target
+
+    tries_left = 6 - game_data["attempts"]
 
     return {
         "guess": guess,
         "feedback": feedback,
         "is_correct": is_correct,
-        "game_over": game_data["status"] != "PLAYING",
-        "target_word": target if (is_correct or game_data["status"] == "LOST") else None
+        "game_over": game_over,
+        "attempts": game_data["attempts"],
+        "tries_left": tries_left,
+        "target_word": target_word_to_return,
+        "stats": {"total_games": total_games, "wins": wins}
     }
 
 if __name__ == "__main__":
